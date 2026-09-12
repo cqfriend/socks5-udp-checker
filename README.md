@@ -21,7 +21,8 @@
 
 ## ✨ 核心特性 (Features)
 
-- **六维全景检测**：
+- **六维全景检测与真实出口 IP**：
+  0. **代理真实出口 IP 查询**：自动通过 `ip.sb` (GeoIP) 等接口获取代理实际对外请求的真实出口 IP、国家、省市及 ISP 运营商信息
   1. **标准 SOCKS5 UDP (NTP 123)**：RFC 1928 `UDP ASSOCIATE` 模式，测量 RTT 延迟、服务器时间与 Stratum
   2. **DNS 查询检测 (UDP 53)**：向公共 DNS（默认 `223.5.5.5:53`）查询 `one.one.one.one`，排查单端口拦截
   3. **ATYP 域名远端解析检测**：对比 IPv4 (`0x01`) 与 FQDN 域名 (`0x03`)，精准识别代理是否缺少远端 UDP DNS 模块
@@ -85,7 +86,8 @@ Options:
   -ntp <string>          -target 的别名
   -dns-server <string>   DNS 测试服务器 (默认: "223.5.5.5:53")
   -stun-server <string>  STUN 测试服务器 (默认: "stun.miwifi.com:3478")
-  -mode <string>         测试模式: all, standard, uot-v1, uot-v2, uot, dns, atyp, nat, stun (默认: "all")
+  -mode <string>         测试模式: all, standard, uot-v1, uot-v2, uot, dns, atyp, nat, stun, ip (默认: "all")
+  -ip                    仅查询并输出代理实际出口 IP 与归属地
   -dns                   仅测试 DNS 解析 (UDP 53)
   -atyp                  仅测试 ATYP 域名与 IPv4 远端解析能力
   -nat, -stun            仅测试代理节点的 NAT 穿透类型 (STUN)

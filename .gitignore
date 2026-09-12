@@ -34,3 +34,5 @@ go.work.sum
 # GoReleaser build artifacts
 dist/
 socks5-udp-checker
+socks-over-udp
+socks-udp-check

@@ -52,7 +52,6 @@ fi
 # Build local binary for immediate use
 echo "🔨 Building local executable for current system..."
 go build -trimpath -ldflags "${LDFLAGS}" -o "${APP_NAME}" ./cmd
-cp "${APP_NAME}" "${ALT_NAME}"
 
 echo ""
 echo "✅ Build completed! Generated binaries:"

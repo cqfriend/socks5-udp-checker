@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -63,6 +66,15 @@ type socks5Config struct {
 	address  string
 	username string
 	password string
+}
+
+type ProxyExitInfo struct {
+	IP      string `json:"ip"`
+	Country string `json:"country"`
+	Region  string `json:"region"`
+	City    string `json:"city"`
+	ISP     string `json:"isp"`
+	ASNOrg  string `json:"asn_organization"`
 }
 
 type TestResult struct {
@@ -442,6 +454,118 @@ func splitHostPort(addr string, defaultPort int) (string, int, error) {
 }
 
 // -----------------------------------------------------------------------------
+// Query Proxy Exit IP (via api.ip.sb / geoip)
+// -----------------------------------------------------------------------------
+
+func QueryProxyExitIP(cfg socks5Config, timeout time.Duration, debug *DebugLogger) (*ProxyExitInfo, error) {
+	debug.Logf("--- [START] Querying Proxy Exit IP via ip.sb ---")
+
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		h, pStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		p, err := strconv.Atoi(pStr)
+		if err != nil {
+			return nil, err
+		}
+
+		debug.Logf("Exit IP: dialing proxy %s to reach %s...", cfg.address, addr)
+		conn, err := net.DialTimeout("tcp", cfg.address, timeout)
+		if err != nil {
+			return nil, fmt.Errorf("connect proxy failed: %w", err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+
+		if err := socks5Handshake(conn, cfg.username, cfg.password, debug); err != nil {
+			conn.Close()
+			return nil, err
+		}
+
+		if err := socks5Connect(conn, h, p, debug); err != nil {
+			conn.Close()
+			return nil, err
+		}
+
+		return conn, nil
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: dialContext,
+		},
+		Timeout: timeout,
+	}
+
+	// 1. Primary: https://api.ip.sb/geoip
+	req, err := http.NewRequest("GET", "https://api.ip.sb/geoip", nil)
+	if err == nil {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; socks5-udp-checker/1.1.0)")
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			var info ProxyExitInfo
+			if err := json.NewDecoder(resp.Body).Decode(&info); err == nil && info.IP != "" {
+				debug.Logf("Exit IP: successfully fetched via api.ip.sb/geoip: %s (%s, %s)", info.IP, info.Country, info.ISP)
+				return &info, nil
+			}
+		} else if resp != nil {
+			resp.Body.Close()
+		}
+	}
+
+	// 2. Fallback: http://api.ip.sb/ip
+	debug.Logf("Exit IP: trying fallback http://api.ip.sb/ip...")
+	req2, err := http.NewRequest("GET", "http://api.ip.sb/ip", nil)
+	if err == nil {
+		req2.Header.Set("User-Agent", "curl/7.88.1")
+		resp, err := client.Do(req2)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			ipStr := strings.TrimSpace(string(body))
+			if net.ParseIP(ipStr) != nil {
+				debug.Logf("Exit IP: successfully fetched via api.ip.sb/ip: %s", ipStr)
+				return &ProxyExitInfo{IP: ipStr}, nil
+			}
+		} else if resp != nil {
+			resp.Body.Close()
+		}
+	}
+
+	// 3. Fallback: http://ip-api.com/json/
+	debug.Logf("Exit IP: trying fallback http://ip-api.com/json/...")
+	req3, err := http.NewRequest("GET", "http://ip-api.com/json/", nil)
+	if err == nil {
+		resp, err := client.Do(req3)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			var raw struct {
+				Query      string `json:"query"`
+				Country    string `json:"country"`
+				RegionName string `json:"regionName"`
+				City       string `json:"city"`
+				ISP        string `json:"isp"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&raw); err == nil && raw.Query != "" {
+				debug.Logf("Exit IP: successfully fetched via ip-api.com: %s", raw.Query)
+				return &ProxyExitInfo{
+					IP:      raw.Query,
+					Country: raw.Country,
+					Region:  raw.RegionName,
+					City:    raw.City,
+					ISP:     raw.ISP,
+				}, nil
+			}
+		} else if resp != nil {
+			resp.Body.Close()
+		}
+	}
+
+	return nil, errors.New("failed to retrieve exit IP from all query services")
+}
+
+// -----------------------------------------------------------------------------
 // SOCKS5 UDP Relay Dialing & Packaging
 // -----------------------------------------------------------------------------
 
@@ -571,9 +695,7 @@ func (c *standardUDPConn) WriteToTarget(b []byte, targetHost string, targetPort 
 	var packet bytes.Buffer
 	packet.Write([]byte{0x00, 0x00, 0x00}) // RSV + FRAG
 
-	// Determine address representation based on ATYP mode
 	if c.atyp == atypForceIP {
-		// Force IP mode: resolve locally if it's a domain name
 		ip := net.ParseIP(targetHost)
 		if ip == nil {
 			ips, err := net.LookupIP(targetHost)
@@ -591,13 +713,11 @@ func (c *standardUDPConn) WriteToTarget(b []byte, targetHost string, targetPort 
 			packet.Write(ip.To16())
 		}
 	} else if c.atyp == atypForceDomain {
-		// Force Domain mode: send verbatim as ATYP 0x03
 		packet.WriteByte(atypDomain)
 		packet.WriteByte(byte(len(targetHost)))
 		packet.WriteString(targetHost)
 		c.debug.Logf("ATYP Force Domain: sending target %s as FQDN (0x03)", targetHost)
 	} else {
-		// Auto mode
 		if ip := net.ParseIP(targetHost); ip != nil {
 			if ip4 := ip.To4(); ip4 != nil {
 				packet.WriteByte(atypIPv4)
@@ -712,7 +832,6 @@ func TestDNSQuery(cfg socks5Config, dnsServer string, timeout time.Duration, deb
 	}
 	defer conn.Close()
 
-	// Query for one.one.one.one (A record)
 	const queryDomain = "one.one.one.one"
 	const queryID uint16 = 0x5a5a
 	queryPacket := buildDNSQuery(queryDomain, queryID)
@@ -746,22 +865,19 @@ func TestDNSQuery(cfg socks5Config, dnsServer string, timeout time.Duration, deb
 
 func buildDNSQuery(domain string, id uint16) []byte {
 	var buf bytes.Buffer
-	// Header: ID(2), Flags(2), QDCOUNT(2), ANCOUNT(2), NSCOUNT(2), ARCOUNT(2)
 	hdr := make([]byte, 12)
 	binary.BigEndian.PutUint16(hdr[0:2], id)
-	binary.BigEndian.PutUint16(hdr[2:4], 0x0100) // standard query, recursion desired
-	binary.BigEndian.PutUint16(hdr[4:6], 1)      // 1 question
+	binary.BigEndian.PutUint16(hdr[2:4], 0x0100)
+	binary.BigEndian.PutUint16(hdr[4:6], 1)
 	buf.Write(hdr)
 
-	// QNAME: labels
 	labels := strings.Split(domain, ".")
 	for _, label := range labels {
 		buf.WriteByte(byte(len(label)))
 		buf.WriteString(label)
 	}
-	buf.WriteByte(0x00) // root label
+	buf.WriteByte(0x00)
 
-	// QTYPE(A=1), QCLASS(IN=1)
 	tail := make([]byte, 4)
 	binary.BigEndian.PutUint16(tail[0:2], 1)
 	binary.BigEndian.PutUint16(tail[2:4], 1)
@@ -791,9 +907,7 @@ func parseDNSResponse(data []byte, expectedID uint16) (net.IP, error) {
 		return nil, errors.New("DNS response contains 0 answers")
 	}
 
-	// Skip Question section
 	offset := 12
-	// Skip QNAME
 	for offset < len(data) {
 		l := int(data[offset])
 		if l == 0 {
@@ -802,11 +916,9 @@ func parseDNSResponse(data []byte, expectedID uint16) (net.IP, error) {
 		}
 		offset += 1 + l
 	}
-	offset += 4 // QTYPE + QCLASS
+	offset += 4
 
-	// Parse Answers
 	for i := 0; i < int(ancount) && offset < len(data); i++ {
-		// Skip Name (handle compression pointer 0xC0 or standard label)
 		if offset+2 <= len(data) && data[offset]&0xC0 == 0xC0 {
 			offset += 2
 		} else {
@@ -849,7 +961,6 @@ func TestATYPResolution(cfg socks5Config, ntpServer string, timeout time.Duratio
 		return nil, fmt.Errorf("invalid NTP server %q: %w", ntpServer, err)
 	}
 
-	// 1. Test ATYP = 0x01 (IPv4 mode)
 	debug.Logf("ATYP Test: Step 1 - testing IPv4 ATYP (0x01)...")
 	startIP := time.Now()
 	dialerIP := func(_, _ string) (net.Conn, error) {
@@ -866,7 +977,6 @@ func TestATYPResolution(cfg socks5Config, ntpServer string, timeout time.Duratio
 		debug.Logf("ATYP Test: IPv4 (0x01) FAILED: %v", errIP)
 	}
 
-	// 2. Test ATYP = 0x03 (Domain mode)
 	debug.Logf("ATYP Test: Step 2 - testing Domain ATYP (0x03)...")
 	startDomain := time.Now()
 	dialerDomain := func(_, _ string) (net.Conn, error) {
@@ -918,14 +1028,12 @@ func TestNATType(cfg socks5Config, primarySTUN string, timeout time.Duration, de
 		return nil, fmt.Errorf("invalid STUN server %q: %w", primarySTUN, err)
 	}
 
-	// Step 1: Connect to SOCKS5 UDP relay
 	conn, err := dialSocks5UDP(cfg, stunHost, stunPort, timeout, atypAuto, debug)
 	if err != nil {
 		return &NATTestResult{Success: false, Error: err, NATType: "UDP Blocked / Unavailable"}, err
 	}
 	defer conn.Close()
 
-	// STUN Test 1: Send Binding Request to Primary STUN Server
 	debug.Logf("STUN: Sending Test 1 request to %s:%d...", stunHost, stunPort)
 	tid1 := make([]byte, 12)
 	_, _ = rand.Read(tid1)
@@ -957,7 +1065,6 @@ func TestNATType(cfg socks5Config, primarySTUN string, timeout time.Duration, de
 	mappedIP1 := res1.mappedIP
 	mappedPort1 := res1.mappedPort
 
-	// STUN Test 2: Request server to change both IP and Port (Testing for Full Cone NAT)
 	debug.Logf("STUN: Sending Test 2 (Change-IP & Change-Port)...")
 	tid2 := make([]byte, 12)
 	_, _ = rand.Read(tid2)
@@ -983,7 +1090,6 @@ func TestNATType(cfg socks5Config, primarySTUN string, timeout time.Duration, de
 	}
 	debug.Logf("STUN Test 2: No response from alternative IP/Port (Not Full Cone)")
 
-	// STUN Test 3: Send to a different IP or Server to detect Symmetric vs Restricted Cone
 	secondaryTarget := res1.otherIP
 	secondaryPort := res1.otherPort
 	if secondaryTarget == "" || secondaryPort == 0 {
@@ -1061,7 +1167,7 @@ func buildSTUNBindingRequest(tid []byte, changeIP, changePort bool) []byte {
 
 	var attrLen uint16
 	if changeIP || changePort {
-		attrLen = 8 // 4-byte header + 4-byte value
+		attrLen = 8
 	}
 
 	hdr := make([]byte, 20)
@@ -1099,11 +1205,6 @@ func parseSTUNResponse(data []byte, expectedTID []byte) (*stunResponse, error) {
 		return nil, fmt.Errorf("unexpected STUN message type: 0x%04x", msgType)
 	}
 
-	// Verify transaction ID if available
-	if len(expectedTID) >= 12 && !bytes.Equal(data[8:20], expectedTID[:12]) {
-		// Non-matching TID might be acceptable for change-ip responses, but log if needed
-	}
-
 	res := &stunResponse{}
 	offset := 20
 	msgLen := int(binary.BigEndian.Uint16(data[2:4]))
@@ -1124,14 +1225,14 @@ func parseSTUNResponse(data []byte, expectedTID []byte) (*stunResponse, error) {
 
 		switch attrType {
 		case stunAttrMappedAddress:
-			if len(val) >= 8 && val[1] == 0x01 { // IPv4
+			if len(val) >= 8 && val[1] == 0x01 {
 				port := binary.BigEndian.Uint16(val[2:4])
 				ip := net.IP(val[4:8]).String()
 				res.mappedIP = ip
 				res.mappedPort = int(port)
 			}
 		case stunAttrXorMappedAddress:
-			if len(val) >= 8 && val[1] == 0x01 { // IPv4
+			if len(val) >= 8 && val[1] == 0x01 {
 				port := binary.BigEndian.Uint16(val[2:4]) ^ 0x2112
 				ipBytes := make([]byte, 4)
 				ipUint := binary.BigEndian.Uint32(val[4:8]) ^ stunMagicCookie
@@ -1140,14 +1241,14 @@ func parseSTUNResponse(data []byte, expectedTID []byte) (*stunResponse, error) {
 				res.mappedPort = int(port)
 			}
 		case stunAttrChangedAddress, stunAttrOtherAddress:
-			if len(val) >= 8 && val[1] == 0x01 { // IPv4
+			if len(val) >= 8 && val[1] == 0x01 {
 				port := binary.BigEndian.Uint16(val[2:4])
 				ip := net.IP(val[4:8]).String()
 				res.otherIP = ip
 				res.otherPort = int(port)
 			}
 		case stunAttrSourceAddress, stunAttrResponseOrigin:
-			if len(val) >= 8 && val[1] == 0x01 { // IPv4
+			if len(val) >= 8 && val[1] == 0x01 {
 				port := binary.BigEndian.Uint16(val[2:4])
 				ip := net.IP(val[4:8]).String()
 				res.originIP = ip
@@ -1155,7 +1256,6 @@ func parseSTUNResponse(data []byte, expectedTID []byte) (*stunResponse, error) {
 			}
 		}
 
-		// STUN attributes are padded to multiples of 4 bytes
 		paddedLen := (attrLen + 3) &^ 3
 		offset += paddedLen
 	}
@@ -1416,7 +1516,7 @@ func TestUoTv2(cfg socks5Config, ntpServer string, timeout time.Duration, debug 
 
 		debug.Logf("UoT v2: sending handshake header (isConnect=1, target=%s:%d)...", ntpHost, ntpPort)
 		var hs bytes.Buffer
-		hs.WriteByte(0x01) // isConnect = true
+		hs.WriteByte(0x01)
 
 		if ip := net.ParseIP(ntpHost); ip != nil {
 			if ip4 := ip.To4(); ip4 != nil {

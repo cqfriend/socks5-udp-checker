@@ -9,7 +9,7 @@ import (
 )
 
 var (
-	version = "1.1.0"
+	version = "1.2.0"
 	commit  = "none"
 	date    = "unknown"
 	builtBy = "unknown"
@@ -28,6 +28,7 @@ func main() {
 		dnsOnlyFlag    bool
 		atypOnlyFlag   bool
 		natOnlyFlag    bool
+		ipOnlyFlag     bool
 		versionFlag    bool
 		helpFlag       bool
 	)
@@ -40,13 +41,14 @@ func main() {
 	fs.StringVar(&ntpFlag, "ntp", "", "Alias for -target")
 	fs.StringVar(&dnsServerFlag, "dns-server", "223.5.5.5:53", "DNS test server for UDP 53 testing")
 	fs.StringVar(&stunServerFlag, "stun-server", "stun.miwifi.com:3478", "STUN test server for NAT type detection")
-	fs.StringVar(&modeFlag, "mode", "all", "Detection mode: all, standard, uot-v1, uot-v2, uot, dns, atyp, nat, stun")
+	fs.StringVar(&modeFlag, "mode", "all", "Detection mode: all, standard, uot-v1, uot-v2, uot, dns, atyp, nat, stun, ip")
 	fs.DurationVar(&timeoutFlag, "timeout", 5*time.Second, "Connection and request timeout")
 	fs.BoolVar(&debugFlag, "debug", false, "Enable verbose protocol debug logging")
 	fs.BoolVar(&dnsOnlyFlag, "dns", false, "Enable DNS (UDP 53) detection mode")
 	fs.BoolVar(&atypOnlyFlag, "atyp", false, "Enable ATYP domain vs IPv4 resolution check")
 	fs.BoolVar(&natOnlyFlag, "nat", false, "Enable NAT type detection (STUN)")
 	fs.BoolVar(&natOnlyFlag, "stun", false, "Alias for -nat")
+	fs.BoolVar(&ipOnlyFlag, "ip", false, "Only query and output proxy exit IP")
 	fs.BoolVar(&versionFlag, "version", false, "Show version information")
 	fs.BoolVar(&versionFlag, "v", false, "Alias for -version")
 	fs.BoolVar(&helpFlag, "help", false, "Show usage help")
@@ -108,9 +110,10 @@ func main() {
 
 	debug := &DebugLogger{enabled: debugFlag}
 
-	// Adjust mode if specific test flag was set
 	effectiveMode := strings.ToLower(modeFlag)
-	if dnsOnlyFlag && effectiveMode == "all" {
+	if ipOnlyFlag {
+		effectiveMode = "ip"
+	} else if dnsOnlyFlag && effectiveMode == "all" {
 		effectiveMode = "dns"
 	} else if atypOnlyFlag && effectiveMode == "all" {
 		effectiveMode = "atyp"
@@ -118,11 +121,41 @@ func main() {
 		effectiveMode = "nat"
 	}
 
+	// If mode is ip only, just query and output exit IP directly
+	if effectiveMode == "ip" {
+		exitInfo, err := QueryProxyExitIP(cfg, timeoutFlag, debug)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to query exit IP: %v\n", err)
+			os.Exit(1)
+		}
+		locParts := formatLocation(exitInfo)
+		if locParts != "" {
+			fmt.Printf("%s (%s)\n", exitInfo.IP, locParts)
+		} else {
+			fmt.Println(exitInfo.IP)
+		}
+		os.Exit(0)
+	}
+
 	fmt.Println("==================================================")
 	fmt.Println("         SOCKS5 UDP & UoT Checker")
 	fmt.Println("==================================================")
 	maskedProxy := maskPassword(cfg)
 	fmt.Printf("Proxy:       %s\n", maskedProxy)
+
+	// Query Proxy Exit IP
+	exitInfo, exitErr := QueryProxyExitIP(cfg, timeoutFlag, debug)
+	var exitLocStr string
+	if exitErr == nil && exitInfo != nil {
+		loc := formatLocation(exitInfo)
+		if loc != "" {
+			exitLocStr = fmt.Sprintf(" (%s)", loc)
+		}
+		fmt.Printf("Exit IP:     \033[32m%s\033[0m%s\n", exitInfo.IP, exitLocStr)
+	} else {
+		fmt.Printf("Exit IP:     \033[33m[Query Failed: %v]\033[0m\n", exitErr)
+	}
+
 	fmt.Printf("NTP Target:  %s\n", targetServer)
 	if effectiveMode == "all" || effectiveMode == "dns" {
 		fmt.Printf("DNS Target:  %s\n", dnsServerFlag)
@@ -139,7 +172,7 @@ func main() {
 
 	type testItem struct {
 		title string
-		run   func() (bool, string, string) // success, mainStatus, detailText
+		run   func() (bool, string, string)
 	}
 
 	var items []testItem
@@ -290,6 +323,12 @@ func main() {
 
 	fmt.Println("==================================================")
 	fmt.Println("Summary:")
+	if exitInfo != nil && exitInfo.IP != "" {
+		fmt.Printf("  • Proxy Outbound Exit IP          : \033[32m%s\033[0m%s\n", exitInfo.IP, exitLocStr)
+	} else {
+		fmt.Printf("  • Proxy Outbound Exit IP          : \033[31mUNREACHABLE / TIMEOUT\033[0m\n")
+	}
+
 	for _, s := range summaries {
 		if s.success {
 			fmt.Printf("  • %-32s: \033[32m%s\033[0m\n", s.title, s.status)
@@ -303,6 +342,26 @@ func main() {
 		os.Exit(1)
 	}
 	os.Exit(0)
+}
+
+func formatLocation(info *ProxyExitInfo) string {
+	if info == nil {
+		return ""
+	}
+	var parts []string
+	if info.Country != "" {
+		parts = append(parts, info.Country)
+	}
+	if info.Region != "" && info.Region != info.Country {
+		parts = append(parts, info.Region)
+	}
+	if info.City != "" && info.City != info.Region {
+		parts = append(parts, info.City)
+	}
+	if info.ISP != "" {
+		parts = append(parts, info.ISP)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func splitFlagsAndPositional(args []string) ([]string, []string) {
@@ -376,7 +435,8 @@ Options:
   -ntp <string>          Alias for -target
   -dns-server <string>   DNS server for UDP 53 testing (default: "223.5.5.5:53")
   -stun-server <string>  STUN server for NAT type testing (default: "stun.miwifi.com:3478")
-  -mode <string>         Test mode: all, standard, uot-v1, uot-v2, uot, dns, atyp, nat, stun (default: "all")
+  -mode <string>         Test mode: all, standard, uot-v1, uot-v2, uot, dns, atyp, nat, stun, ip (default: "all")
+  -ip                    Only query and print proxy real exit IP
   -dns                   Test DNS resolution on UDP port 53
   -atyp                  Test ATYP remote domain vs IPv4 resolution in UDP datagrams
   -nat, -stun            Test NAT type classification (Full Cone / Symmetric / Restricted)
@@ -387,8 +447,8 @@ Options:
 
 Examples:
   socks5-udp-checker -proxy 127.0.0.1:1080
+  socks5-udp-checker -proxy user:pass@127.0.0.1:1080 -ip
   socks5-udp-checker -proxy user:pass@127.0.0.1:1080 -dns
   socks5-udp-checker -proxy 127.0.0.1:1080 -nat
-  socks5-udp-checker -proxy 127.0.0.1:1080 -atyp
   socks5-udp-checker -proxy 127.0.0.1:1080:user:pass -mode all -debug`)
 }
