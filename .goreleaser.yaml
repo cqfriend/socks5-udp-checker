@@ -3,13 +3,6 @@ version: 2
 
 project_name: socks5-udp-checker
 
-before:
-  hooks:
-    # You may remove this if you don't use go modules.
-    - go mod tidy
-    # you may remove this if you don't need go generate
-    - go generate ./...
-
 builds:
   - id: socks5-udp-checker
     main: ./cmd
@@ -23,10 +16,6 @@ builds:
     goarch:
       - amd64
       - arm64
-    # Optional: exclude specific combinations
-    ignore:
-      - goos: windows
-        goarch: arm64
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
@@ -42,9 +31,8 @@ archives:
       {{ .ProjectName }}-
       {{- .Os }}-
       {{- if eq .Arch "amd64" }}amd64
-      {{- else if eq .Arch "386" }}i386
+      {{- else if eq .Arch "arm64" }}arm64
       {{- else }}{{ .Arch }}{{ end }}
-      {{- if .Arm }}v{{ .Arm }}{{ end }}
       {{- if eq .Os "windows" }}.exe{{ end }}
 
 checksum:
@@ -73,47 +61,26 @@ changelog:
     - title: Others
       order: 999
 
-# GitHub release configuration
+# GitHub release configuration (auto-detects repository)
 release:
-  github:
-    owner: iproxy-online
-    name: socks5-udp-checker
   draft: false
   prerelease: auto
   mode: replace
   header: |
-    ## SOCKS5 UDP Checker {{.Tag}}
+    ## SOCKS5 UDP & UoT Checker {{.Tag}}
 
-    A simple command-line tool for testing UDP support in SOCKS5 proxy servers using the Network Time Protocol (NTP).
+    SOCKS5 UDP & UoT Checker is a cross-platform command-line utility to test SOCKS5 proxy UDP support, UDP-over-TCP (UoT v1/v2), DNS (UDP 53) resolution, ATYP remote domain resolution, and NAT type classification (STUN).
 
-    SOCKS5 UDP Checker is a cross-platform command-line utility that verifies whether SOCKS5 proxy servers properly support UDP traffic forwarding. The tool performs this verification by attempting to execute Network Time Protocol (NTP) queries through the specified proxy connection.
+    ### Assets
 
-    ### Installation
-
-    Download the appropriate binary for your operating system from the release assets below:
-
-    - **Linux**: `socks5-udp-checker-linux-amd64`
+    Download the pre-compiled executable for your platform:
+    - **Linux (amd64)**: `socks5-udp-checker-linux-amd64`
+    - **Linux (arm64)**: `socks5-udp-checker-linux-arm64`
     - **macOS (Intel)**: `socks5-udp-checker-darwin-amd64`
     - **macOS (Apple Silicon)**: `socks5-udp-checker-darwin-arm64`
-    - **Windows**: `socks5-udp-checker-windows-amd64.exe`
-
-    ### Getting Started
-
-    Run the application from your terminal:
-
-    ```bash
-    socks5-udp-checker
-    ```
-
-    The interactive interface will guide you through:
-    1. Enter your SOCKS5 proxy details
-    2. Specify an NTP server (default: `time.google.com:123`)
-    3. Press Enter to test UDP connectivity
-    4. Review the results
+    - **Windows (amd64)**: `socks5-udp-checker-windows-amd64.exe`
+    - **Windows (arm64)**: `socks5-udp-checker-windows-arm64.exe`
 
   footer: |
-    ## Thanks
-
-    Thanks to everyone who contributed to this release!
-
-    **Full Changelog**: https://github.com/iproxy-online/socks5-udp-checker/compare/{{ .PreviousTag }}...{{ .Tag }}
+    ---
+    *Built with GoReleaser and GitHub Actions*

@@ -4,15 +4,22 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.1.0). If empty and commit is not tagged, defaults to next version.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
 
 jobs:
   goreleaser:
+    name: Build & Release
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -21,6 +28,37 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+          cache: true
+
+      - name: Run automated tests
+        run: go test -v ./...
+
+      - name: Ensure git tag exists
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          CURRENT_TAG="$(git tag --points-at HEAD 2>/dev/null | head -n 1)"
+          if [ -z "$CURRENT_TAG" ]; then
+            TAG_NAME="${{ inputs.tag }}"
+            if [ -z "$TAG_NAME" ]; then
+              LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
+              # Extract version numbers
+              if [[ "$LATEST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                MAJOR="${BASH_REMATCH[1]}"
+                MINOR="${BASH_REMATCH[2]}"
+                PATCH=$((BASH_REMATCH[3] + 1))
+                TAG_NAME="v${MAJOR}.${MINOR}.${PATCH}"
+              else
+                TAG_NAME="v1.1.0"
+              fi
+            fi
+            echo "🏷️ Tagging HEAD as $TAG_NAME..."
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+            git push origin "$TAG_NAME"
+          else
+            echo "🏷️ HEAD already tagged as $CURRENT_TAG"
+          fi
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
